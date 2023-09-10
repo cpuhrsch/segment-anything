@@ -111,6 +111,7 @@ class ImageEncoderViT(nn.Module):
         for blk in self.blocks:
             x = blk(x)
 
+        # x = x.contiguous()
         x = self.neck(x.permute(0, 3, 1, 2))
 
         return x
@@ -228,16 +229,25 @@ class Attention(nn.Module):
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
-        attn_bias = None
-        if self.use_rel_pos:
-            attn_bias = add_decomposed_rel_pos(q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+        # attn_bias = None
+        assert self.use_rel_pos
+        rel_h, rel_w = add_decomposed_rel_pos(q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
 
         q = q.view(B, self.num_heads, H * W, -1)
         k = k.view(B, self.num_heads, H * W, -1)
         v = v.view(B, self.num_heads, H * W, -1)
-        attn_bias = attn_bias.view(B, self.num_heads, attn_bias.size(-1), attn_bias.size(-1))
+        rel_h = rel_h.view(B, self.num_heads, rel_h.size(1), rel_h.size(2), rel_h.size(3))
+        rel_w = rel_w.view(B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3))
+        # attn_bias = attn_bias.view(B, self.num_heads, attn_bias.size(-1), attn_bias.size(-1))
 
-        x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+        from .flash_2 import attention
+        import math
+        attn_bias = (rel_h + rel_w).view(B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4))
+        attn_bias = attn_bias.contiguous()
+        # x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=(rel_h + rel_w).view(B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4)))
+        x = attention(q, k, v, attn_bias, 1. / math.sqrt(q.size(-1)))
+        # x = attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_bias, False, 1. / math.sqrt(q.size(-1)))
+        x = x.contiguous()
 
         x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
 
@@ -358,10 +368,17 @@ def add_decomposed_rel_pos(
     r_q = q.reshape(B, q_h, q_w, dim)
     rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    rel_h = rel_h.unsqueeze(-1)
+    rel_w = rel_w.unsqueeze(-2)
+    rel_h = rel_h.reshape(B, q_h * q_w, k_h, 1).contiguous()
+    rel_w = rel_w.reshape(B, q_h * q_w, 1, k_w).contiguous()
+    return rel_h, rel_w
 
     attn = (
-        rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
+        # rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
+        rel_h + rel_w
     ).reshape(B, q_h * q_w, k_h * k_w)
+    # import pdb; pdb.set_trace()
 
     return attn
 
