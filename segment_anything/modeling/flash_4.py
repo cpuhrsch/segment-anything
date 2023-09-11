@@ -11,7 +11,6 @@ Extra Credits:
 
 """
 
-import pytest
 import torch
 
 import triton
@@ -33,13 +32,11 @@ def _fwd_kernel(
     stride_vz, stride_vh, stride_vk, stride_vn,
     stride_oz, stride_oh, stride_om, stride_on,
     stride_b0z, stride_b0h, stride_b0m, stride_b0n,
-    # stride_b1z, stride_b1h, stride_b1m, stride_b1n,
     Z,
     H,
     N_CTX,
     P_SEQ,
     b0_numel,
-    # b1_numel,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -162,7 +159,21 @@ def _fwd_kernel(
     tl.store(O_block_ptr, acc.to(tl.float16))
 
 
-def attention(q, k, v, b0, b1, sm_scale):
+def attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
+    """
+    Implements SDPA but bias is addition of (rel_h + rel_w).view(..., rel_h.size(-2) * rel_w.size(-1))
+    """
+
+    import math
+    sm_scale = 1. / math.sqrt(q_.size(-1))
+    q_size_2_padded = (((q_.size(-2) + 256 - 1) // 256) * 256) - q_.size(-2)
+    q = torch.nn.functional.pad(q_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
+    k = torch.nn.functional.pad(k_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
+    v = torch.nn.functional.pad(v_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
+
+    rel_h = torch.nn.functional.pad(rel_h_.squeeze(-1), (0, 0, 0, q_size_2_padded), "constant", float("-inf"))
+    rel_w = torch.nn.functional.pad(rel_w_.squeeze(-2), (0, 0, 0, q_size_2_padded), "constant", float("-inf"))
+
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
@@ -177,10 +188,13 @@ def attention(q, k, v, b0, b1, sm_scale):
     L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
     P_SEQ = 0 if q.shape[-2] == k.shape[-2] else k.shape[-2] - q.shape[-2]
     assert P_SEQ == 0
-    assert b0.stride(0) == b1.stride(0)
-    assert b0.stride(1) == b1.stride(1)
-    assert b0.stride(2) == b1.stride(2)
-    assert b0.stride(3) == b1.stride(3)
+    assert rel_h.stride(0) == rel_w.stride(0)
+    assert rel_h.stride(1) == rel_w.stride(1)
+    assert rel_h.stride(2) == rel_w.stride(2)
+    assert rel_h.stride(3) == rel_w.stride(3)
+    assert rel_h.size(-1)  == rel_w.size(-1)
+    b0 = rel_h
+    b1 = rel_w
     _fwd_kernel[grid](
         q, k, v, b0, b1, sm_scale,
         L,
@@ -190,15 +204,13 @@ def attention(q, k, v, b0, b1, sm_scale):
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         b0.stride(0), b0.stride(1), b0.stride(2), b0.stride(3),
-        # b1.stride(0), b1.stride(1), b1.stride(2), b1.stride(3),
         q.shape[0],
         q.shape[1],
         q.shape[2],
         P_SEQ,
         b0.size(-1),
-        # b1.size(-1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
         num_warps=num_warps,
         num_stages=num_stages)
 
-    return o
+    return o[:, :, :q_.size(-2), :]

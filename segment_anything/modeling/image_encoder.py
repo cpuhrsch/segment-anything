@@ -240,49 +240,12 @@ class Attention(nn.Module):
         rel_w = rel_w.view(B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3))
         # attn_bias = attn_bias.view(B, self.num_heads, attn_bias.size(-1), attn_bias.size(-1))
 
-        attn_bias = (rel_h + rel_w).view(B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4))
         if False:
+            attn_bias = (rel_h + rel_w).view(B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4))
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         else:
-            # from .flash_2 import attention
-            from .flash_4 import attention
-            import math
-            # print("q.size(): ", q.size())
-            q_size_2_padded = (((q.size(-2) + 256 - 1) // 256) * 256) - q.size(-2)
-            q_padded = F.pad(q, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
-            k_padded = F.pad(k, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
-            v_padded = F.pad(v, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
-            # print("q_padded.size(): ", q_padded.size())
-
-            # # print("attn_bias.size(): ", attn_bias.size())
-            # attn_bias_padded = F.pad(attn_bias, (0, q_size_2_padded, 0, q_size_2_padded), "constant", float("-inf"))
-            # attn_bias_padded = attn_bias_padded.contiguous()
-            # # print("attn_bias_padded.size(): ", attn_bias_padded.size())
-            # # print("attn_bias_padded.stride(): ", attn_bias_padded.stride())
-            # # print("attn_bias_padded.numel(): ", attn_bias_padded.numel())
-
-            rel_h_padded = F.pad(rel_h.squeeze(-1), (0, 0, 0, q_size_2_padded), "constant", float("-inf"))
-            rel_h_padded = rel_h_padded.contiguous()
-
-            rel_w_padded = F.pad(rel_w.squeeze(-2), (0, 0, 0, q_size_2_padded), "constant", float("-inf"))
-            rel_w_padded = rel_w_padded.contiguous()
-
-            sm_scale = 1. / math.sqrt(q.size(-1))
-            # x0_padded = attention(q_padded, k_padded, v_padded, attn_bias_padded, sm_scale)
-            x0_padded = attention(q_padded, k_padded, v_padded, rel_h_padded, rel_w_padded, sm_scale)
-            # torch.cuda.synchronize()
-            # x0_padded = torch.nn.functional.scaled_dot_product_attention(q_padded, k_padded, v_padded, scale=sm_scale, attn_mask=attn_bias_padded)
-            x0 = x0_padded[:, :, :q.size(-2), :]
-            x = x0.contiguous()
-            assert x.size() == q.size()
-
-            # x1 = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, attn_mask=attn_bias)
-            # # import pdb; pdb.set_trace()
-            # torch.testing.assert_allclose(x0, x1, atol=2e-1, rtol=9e-2)
-            # import sys; sys.exit(1)
-
-            # attn_bias = attn_bias.contiguous()
-            # x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+            from .flash_4 import attention_rel_h_rel_w
+            x = attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
 
         x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
 
