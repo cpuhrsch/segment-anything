@@ -68,19 +68,7 @@ def _fwd_kernel(
         block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0)
     )
-    # B_block_ptr = B + b_offset
-    # if b_numel < b_offset:
-    #     tl.device_print("WTFF", b_numel, b_offset)
-    # tl.device_print("off_hz: ", off_hz)
-    # tl.device_print("B_block_ptr: ", B_block_ptr)
-    # B_block_ptr = tl.make_block_ptr(
-    #     base=B + b_offset,
-    #     shape=(N_CTX, N_CTX),
-    #     strides=(stride_bm, stride_bn),
-    #     offsets=(start_m * BLOCK_M, 0),
-    #     block_shape=(BLOCK_M, BLOCK_N),
-    #     order=(1, 0)
-    # )
+
     # initialize offsets
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -99,9 +87,9 @@ def _fwd_kernel(
 
     # Bias
     # Get to the right batch + head
-    b_offset = tl.program_id(1) * stride_b0h
+    b_offset = off_hz * stride_b0h
     # Get to the right rows
-    b_ptr_offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    b_ptr_offsets_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     b_ptr_offsets_m = b_ptr_offsets_m * stride_b0m
 
     for start_n in range(lo, hi, BLOCK_N):
@@ -111,6 +99,8 @@ def _fwd_kernel(
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float16)
         qk += tl.dot(q, k, out_dtype=tl.float16) # * qk_scale).to(tl.float16)
+
+        # -- compute rel_h[:, None] + rel_w[None, :] bias ---
         # Get to the right column subsection
         b_ptr_offsets_n_0 = (start_n + tl.arange(0, BLOCK_N)) // b0_numel
         b_ptr_offsets_n_1 = (start_n + tl.arange(0, BLOCK_N)) % b0_numel
@@ -124,11 +114,9 @@ def _fwd_kernel(
         b0 = tl.where(b_mask, tl.load(B0 + b_offset + b_ptr_offsets_0), float('-inf'))
         b1 = tl.where(b_mask, tl.load(B1 + b_offset + b_ptr_offsets_1), float('-inf'))
         b = b0 + b1
-        # b = tl.load(B_block_ptr) #, boundary_check=(1, 0), padding_option="nan")
+
         qk += b
-        # offs_m = (start_m * BLOCK_M + tl.arange(0, BLOCK_M)) < N_CTX
-        # offs_n = (start_n + tl.arange(0, BLOCK_N)) < N_CTX
-        # qk = tl.where(offs_m[:, None] & offs_n[None, :], qk, float("-inf"))
+
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
         alpha = tl.math.exp2(m_i - m_i_new)
@@ -142,11 +130,10 @@ def _fwd_kernel(
         # update pointers
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-        # B_block_ptr = tl.advance(B_block_ptr, (0, BLOCK_N))
+
     # write back l and m
     acc = acc / l_i[:, None]
-    # l_ptrs = L + off_hz * N_CTX + offs_m
-    # tl.store(l_ptrs, m_i + tl.math.log2(l_i))
+
     # write back O
     O_block_ptr = tl.make_block_ptr(
         base=Out + q_offset,
