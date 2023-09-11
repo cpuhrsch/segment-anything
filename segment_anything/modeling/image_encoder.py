@@ -229,23 +229,22 @@ class Attention(nn.Module):
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
-        # attn_bias = None
-        assert self.use_rel_pos
-        rel_h, rel_w = add_decomposed_rel_pos(q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+        rel_h = None
+        rel_w = None
+        if self.use_rel_pos:
+            rel_h, rel_w = add_decomposed_rel_pos(q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
 
         q = q.view(B, self.num_heads, H * W, -1)
         k = k.view(B, self.num_heads, H * W, -1)
         v = v.view(B, self.num_heads, H * W, -1)
         rel_h = rel_h.view(B, self.num_heads, rel_h.size(1), rel_h.size(2), rel_h.size(3))
         rel_w = rel_w.view(B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3))
-        # attn_bias = attn_bias.view(B, self.num_heads, attn_bias.size(-1), attn_bias.size(-1))
 
-        if False:
-            attn_bias = (rel_h + rel_w).view(B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4))
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
-        else:
+        if self.use_rel_pos:
             from .flash_4 import attention_rel_h_rel_w
             x = attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
+        else:
+            x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
         x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
 
@@ -368,17 +367,10 @@ def add_decomposed_rel_pos(
     rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
     rel_h = rel_h.unsqueeze(-1)
     rel_w = rel_w.unsqueeze(-2)
-    rel_h = rel_h.reshape(B, q_h * q_w, k_h, 1).contiguous()
-    rel_w = rel_w.reshape(B, q_h * q_w, 1, k_w).contiguous()
+    rel_h = rel_h.reshape(B, q_h * q_w, k_h, 1)
+    rel_w = rel_w.reshape(B, q_h * q_w, 1, k_w)
+
     return rel_h, rel_w
-
-    attn = (
-        # rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
-        rel_h + rel_w
-    ).reshape(B, q_h * q_w, k_h * k_w)
-    # import pdb; pdb.set_trace()
-
-    return attn
 
 
 class PatchEmbed(nn.Module):
