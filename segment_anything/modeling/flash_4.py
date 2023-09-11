@@ -91,6 +91,9 @@ def _fwd_kernel(
     # Get to the right rows
     b_ptr_offsets_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     b_ptr_offsets_m = b_ptr_offsets_m * stride_b0m
+    b_ptr_offsets_m = b_ptr_offsets_m[:, None]
+    b0_ptr = B0 + b_offset + b_ptr_offsets_m
+    b1_ptr = B1 + b_offset + b_ptr_offsets_m
 
     for start_n in range(lo, hi, BLOCK_N):
         # -- load k, v --
@@ -106,13 +109,13 @@ def _fwd_kernel(
         b_ptr_offsets_n_1 = (start_n + tl.arange(0, BLOCK_N)) % b0_numel
         b_ptr_offsets_n_0 = b_ptr_offsets_n_0 * stride_b0n
         b_ptr_offsets_n_1 = b_ptr_offsets_n_1 * stride_b0n
-        # Construct the block of pointers
-        b_ptr_offsets_0 = b_ptr_offsets_m[:, None] + b_ptr_offsets_n_0[None, :]
-        b_ptr_offsets_1 = b_ptr_offsets_m[:, None] + b_ptr_offsets_n_1[None, :]
+        # # Construct the block of pointers
+        # b_ptr_offsets_0 = b_ptr_offsets_m + b_ptr_offsets_n_0[None, :]
+        # b_ptr_offsets_1 = b_ptr_offsets_m + b_ptr_offsets_n_1[None, :]
         # Combine and load
         b_mask = (start_n + tl.arange(0, BLOCK_N)) < (b0_numel * b0_numel)
-        b0 = tl.where(b_mask, tl.load(B0 + b_offset + b_ptr_offsets_0), float('-inf'))
-        b1 = tl.where(b_mask, tl.load(B1 + b_offset + b_ptr_offsets_1), float('-inf'))
+        b0 = tl.where(b_mask, tl.load(b0_ptr + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last'), float('-inf'))
+        b1 = tl.where(b_mask, tl.load(b1_ptr + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last'), float('-inf'))
         b = b0 + b1
 
         qk += b
@@ -158,8 +161,8 @@ def attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
     k = torch.nn.functional.pad(k_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
     v = torch.nn.functional.pad(v_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
 
-    rel_h = torch.nn.functional.pad(rel_h_.squeeze(-1), (0, 0, 0, q_size_2_padded), "constant", float("-inf"))
-    rel_w = torch.nn.functional.pad(rel_w_.squeeze(-2), (0, 0, 0, q_size_2_padded), "constant", float("-inf"))
+    rel_h = torch.nn.functional.pad(rel_h_.squeeze(-1), (0, 2, 0, q_size_2_padded), "constant", float("-inf"))
+    rel_w = torch.nn.functional.pad(rel_w_.squeeze(-2), (0, 2, 0, q_size_2_padded), "constant", float("-inf"))
 
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
@@ -195,7 +198,7 @@ def attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
         q.shape[1],
         q.shape[2],
         P_SEQ,
-        b0.size(-1),
+        b0.size(-1) - 2,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
         num_warps=num_warps,
         num_stages=num_stages)
