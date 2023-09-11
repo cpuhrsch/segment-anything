@@ -254,16 +254,23 @@ class Attention(nn.Module):
             v_padded = F.pad(v, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
             # print("q_padded.size(): ", q_padded.size())
 
-            # print("attn_bias.size(): ", attn_bias.size())
-            attn_bias_padded = F.pad(attn_bias, (0, q_size_2_padded, 0, q_size_2_padded), "constant", float("-inf"))
-            attn_bias_padded = attn_bias_padded.contiguous()
-            # print("attn_bias_padded.size(): ", attn_bias_padded.size())
-            # print("attn_bias_padded.stride(): ", attn_bias_padded.stride())
-            # print("attn_bias_padded.numel(): ", attn_bias_padded.numel())
+            # # print("attn_bias.size(): ", attn_bias.size())
+            # attn_bias_padded = F.pad(attn_bias, (0, q_size_2_padded, 0, q_size_2_padded), "constant", float("-inf"))
+            # attn_bias_padded = attn_bias_padded.contiguous()
+            # # print("attn_bias_padded.size(): ", attn_bias_padded.size())
+            # # print("attn_bias_padded.stride(): ", attn_bias_padded.stride())
+            # # print("attn_bias_padded.numel(): ", attn_bias_padded.numel())
+
+            rel_h_padded = F.pad(rel_h.squeeze(-1), (0, 0, 0, q_size_2_padded), "constant", float("-inf"))
+            rel_h_padded = rel_h_padded.contiguous()
+
+            rel_w_padded = F.pad(rel_w.squeeze(-2), (0, 0, 0, q_size_2_padded), "constant", float("-inf"))
+            rel_w_padded = rel_w_padded.contiguous()
 
             sm_scale = 1. / math.sqrt(q.size(-1))
-            x0_padded = attention(q_padded, k_padded, v_padded, attn_bias_padded, sm_scale)
-            torch.cuda.synchronize()
+            # x0_padded = attention(q_padded, k_padded, v_padded, attn_bias_padded, sm_scale)
+            x0_padded = attention(q_padded, k_padded, v_padded, rel_h_padded, rel_w_padded, sm_scale)
+            # torch.cuda.synchronize()
             # x0_padded = torch.nn.functional.scaled_dot_product_attention(q_padded, k_padded, v_padded, scale=sm_scale, attn_mask=attn_bias_padded)
             x0 = x0_padded[:, :, :q.size(-2), :]
             x = x0.contiguous()
