@@ -40,21 +40,25 @@ def max_fn(x, y):
 @triton.jit
 def _fwd_kernel(
     Q, K, V, B0, sm_scale,
-    L,
     Out,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vk, stride_vn,
-    stride_oz, stride_oh, stride_om, stride_on,
-    stride_b0z, stride_b0h, stride_b0m, stride_b0n,
+    stride_qh, stride_qm,
+    stride_kh, stride_kn,
+    stride_vh, stride_vk,
+    stride_oh, stride_om,
+    stride_b0h, stride_b0m,
     Z,
     H,
     N_CTX,
     P_SEQ,
+    BIAS_LAST_SIZE: tl.constexpr,
     B0_NUMEL: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+#    **META):
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
 ):
+    # BLOCK_M = META['BLOCK_M']
+    # BLOCK_N = META['BLOCK_N']
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
     q_offset = off_hz * stride_qh
@@ -62,7 +66,7 @@ def _fwd_kernel(
     Q_block_ptr = tl.make_block_ptr(
         base=Q + q_offset,
         shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_qm, stride_qk),
+        strides=(stride_qm, 1),
         offsets=(start_m * BLOCK_M, 0),
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0)
@@ -70,7 +74,7 @@ def _fwd_kernel(
     K_block_ptr = tl.make_block_ptr(
         base=K + kv_offset,
         shape=(BLOCK_DMODEL, N_CTX + P_SEQ),
-        strides=(stride_kk, stride_kn),
+        strides=(1, stride_kn),
         offsets=(0, 0),
         block_shape=(BLOCK_DMODEL, BLOCK_N),
         order=(0, 1)
@@ -78,7 +82,7 @@ def _fwd_kernel(
     V_block_ptr = tl.make_block_ptr(
         base=V + kv_offset,
         shape=(N_CTX + P_SEQ, BLOCK_DMODEL),
-        strides=(stride_vk, stride_vn),
+        strides=(stride_vk, 1),
         offsets=(0, 0),
         block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0)
@@ -100,13 +104,8 @@ def _fwd_kernel(
     lo = 0
     hi = N_CTX + P_SEQ
 
-    # Bias
-    # Get to the right batch + head
-    b_offset = off_hz * stride_b0h
-    # Get to the right rows
-    b_ptr_offsets_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    b_ptr_offsets_m = b_ptr_offsets_m * stride_b0m
-
+    b_mask = tl.arange(0, BLOCK_N)
+    b_ptr_offsets_m = tl.arange(0, BLOCK_M)
     for start_n in range(lo, hi, BLOCK_N):
         # -- load k, v --
         k = tl.load(K_block_ptr) #, boundary_check=(0, 1), padding_option="zero")
@@ -116,21 +115,33 @@ def _fwd_kernel(
         qk += tl.dot(q, k, out_dtype=tl.float16) # * qk_scale).to(tl.float16)
 
         # -- compute rel_h[:, None] + rel_w[None, :] bias ---
+
+        # Bias
+
+        # Get to the right batch + head
+        b_offset = off_hz * stride_b0h
+
+        # # Get to the right rows
+        # b_ptr_offsets_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        # b_ptr_offsets_m = b_ptr_offsets_m * stride_b0m
+
         # Get to the right column subsection
-        bias_last_size = (B0_NUMEL - 4) // 2
-        b_ptr_offsets_n_0 = (start_n + tl.arange(0, BLOCK_N)) // bias_last_size
-        b_ptr_offsets_n_1 = ((start_n + tl.arange(0, BLOCK_N)) % bias_last_size) + bias_last_size
-        b_ptr_offsets_n_0 = b_ptr_offsets_n_0 * stride_b0n
-        b_ptr_offsets_n_1 = b_ptr_offsets_n_1 * stride_b0n
+        # bias_last_size = (B0_NUMEL - 4) // 2
+        b_ptr_offsets_n_0 = (start_n + b_mask) // BIAS_LAST_SIZE
+        b_ptr_offsets_n_1 = ((start_n + b_mask) % BIAS_LAST_SIZE) + BIAS_LAST_SIZE
+        # b_ptr_offsets_n_0 = b_ptr_offsets_n_0 * stride_b0n
+        # b_ptr_offsets_n_1 = b_ptr_offsets_n_1 * stride_b0n
+
         # # Construct the block of pointers
         # b_ptr_offsets_0 = b_ptr_offsets_m + b_ptr_offsets_n_0[None, :]
         # b_ptr_offsets_1 = b_ptr_offsets_m + b_ptr_offsets_n_1[None, :]
+
         # Combine and load
-        b_mask = (start_n + tl.arange(0, BLOCK_N)) < ((B0_NUMEL - 4) * (B0_NUMEL - 4))
-        # b0 = tl.where(b_mask, tl.load(b0_ptr + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last'), float('-inf'))
-        # b1 = tl.where(b_mask, tl.load(b1_ptr + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last'), float('-inf'))
-        qk += tl.load(B0 + b_offset + b_ptr_offsets_m[:, None] + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
-        qk += tl.load(B0 + b_offset + b_ptr_offsets_m[:, None] + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
+        # b_mask = (start_n + tl.arange(0, BLOCK_N)) < ((B0_NUMEL - 4) * (B0_NUMEL - 4))
+        # qk += tl.load(B0 + b_offset + b_ptr_offsets_m[:, None] + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
+        # qk += tl.load(B0 + b_offset + b_ptr_offsets_m[:, None] + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
+        qk += tl.load(B0 + b_offset + ((start_m * BLOCK_M + b_ptr_offsets_m) * stride_b0m)[:, None] + b_ptr_offsets_n_0[None, :], mask=((start_n + b_mask) < ((B0_NUMEL - 4) * (B0_NUMEL - 4)))[None, :], other=float('-inf'))
+        qk += tl.load(B0 + b_offset + ((start_m * BLOCK_M + b_ptr_offsets_m) * stride_b0m)[:, None] + b_ptr_offsets_n_1[None, :], mask=((start_n + b_mask) < ((B0_NUMEL - 4) * (B0_NUMEL - 4)))[None, :], other=float('-inf'))
 
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
@@ -153,7 +164,7 @@ def _fwd_kernel(
     O_block_ptr = tl.make_block_ptr(
         base=Out + q_offset,
         shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_om, stride_on),
+        strides=(stride_om, 1),
         offsets=(start_m * BLOCK_M, 0),
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0)
@@ -166,14 +177,24 @@ def _attention_rel_h_rel_w_kernel(q, k, v, rel_h_w, sm_scale):
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128}
     o = torch.empty_like(q)
+
     BLOCK_M = 128
+
     BLOCK_N = 64 if Lk <= 64 else 32
     num_stages = 4 if Lk <= 64 else 3
-    num_stages = 2
+
+    BLOCK_N = 64
+    num_stages = 4
+
     num_warps = 4
+
+    # BLOCK_M = 32 # 128
+    # BLOCK_N = 32
+    # num_warps = 8
+    # num_stages = 8
+
     grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
     # print("q.shape[0] * q.shape[1]: ", q.shape[0] * q.shape[1])
-    L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
     P_SEQ = 0 if q.shape[-2] == k.shape[-2] else k.shape[-2] - q.shape[-2]
     assert P_SEQ == 0
     # assert rel_h.stride(0) == rel_w.stride(0)
@@ -181,24 +202,31 @@ def _attention_rel_h_rel_w_kernel(q, k, v, rel_h_w, sm_scale):
     # assert rel_h.stride(2) == rel_w.stride(2)
     # assert rel_h.stride(3) == rel_w.stride(3)
     # assert rel_h.size(-1)  == rel_w.size(-1)
-    b0 = rel_h_w
+    b = rel_h_w
+    assert q.is_contiguous()
+    assert k.is_contiguous()
+    assert v.is_contiguous()
+    assert o.is_contiguous()
+    assert b.is_contiguous()
     _fwd_kernel[grid](
         q, k, v,
-        b0,
+        b,
         sm_scale,
-        L,
         o,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-        b0.stride(0), b0.stride(1), b0.stride(2), b0.stride(3),
+        q.stride(1), q.stride(2),
+        k.stride(1), k.stride(2),
+        v.stride(1), v.stride(2),
+        o.stride(1), o.stride(2),
+        b.stride(1), b.stride(2),
         q.shape[0],
         q.shape[1],
         q.shape[2],
         P_SEQ,
-        B0_NUMEL=b0.size(-1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
+        BIAS_LAST_SIZE=((b.size(-1) - 4) // 2),
+        B0_NUMEL=b.size(-1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=Lk,
         num_warps=num_warps,
         num_stages=num_stages)
 
