@@ -106,9 +106,9 @@ def _fwd_kernel(
     # Get to the right rows
     b_ptr_offsets_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     b_ptr_offsets_m = b_ptr_offsets_m * stride_b0m
-    b_ptr_offsets_m = b_ptr_offsets_m[:, None]
-    b0_ptr = B0 + b_offset + b_ptr_offsets_m
-    b1_ptr = B1 + b_offset + b_ptr_offsets_m
+    # b_ptr_offsets_m = b_ptr_offsets_m[:, None]
+    # b0_ptr = B0 + b_offset + b_ptr_offsets_m
+    # b1_ptr = B1 + b_offset + b_ptr_offsets_m
 
     for start_n in range(lo, hi, BLOCK_N):
         # -- load k, v --
@@ -131,11 +131,8 @@ def _fwd_kernel(
         b_mask = (start_n + tl.arange(0, BLOCK_N)) < (b0_numel * b0_numel)
         # b0 = tl.where(b_mask, tl.load(b0_ptr + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last'), float('-inf'))
         # b1 = tl.where(b_mask, tl.load(b1_ptr + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last'), float('-inf'))
-        b0 = tl.load(b0_ptr + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
-        b1 = tl.load(b1_ptr + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
-        b = b0 + b1
-
-        qk += b
+        qk += tl.load(B0 + b_offset + b_ptr_offsets_m[:, None] + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
+        qk += tl.load(B1 + b_offset + b_ptr_offsets_m[:, None] + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
 
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
@@ -189,6 +186,7 @@ def _attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
     BLOCK_M = 128
     BLOCK_N = 64 if Lk <= 64 else 32
     num_stages = 4 if Lk <= 64 else 3
+    num_stages = 2
     num_warps = 4
     grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
     # print("q.shape[0] * q.shape[1]: ", q.shape[0] * q.shape[1])
