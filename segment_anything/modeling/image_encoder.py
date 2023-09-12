@@ -12,6 +12,7 @@ from typing import Optional, Tuple, Type
 
 from .common import LayerNorm2d, MLPBlock
 
+from .flash_4 import _attention_rel_h_rel_w
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
 class ImageEncoderViT(nn.Module):
@@ -239,8 +240,7 @@ class Attention(nn.Module):
         rel_w = rel_w.view(B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3))
 
         if self.use_rel_pos:
-            from .flash_4 import attention_rel_h_rel_w
-            x = attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
+            x = torch.ops.wipflash2.mah_flash(q, k, v, rel_h, rel_w)
         else:
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 

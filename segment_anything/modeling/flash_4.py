@@ -17,6 +17,21 @@ import triton
 import triton.language as tl
 
 
+class _WipFlash2Library:
+    lib = torch.library.Library("wipflash2", "DEF")
+    ops_table: dict[tuple[str, str], callable] = {}
+
+    @classmethod
+    def registerOp(cls, op_key, full_schema, op_impl, dispatch_key):
+        print("cls.ops_table: ", cls.ops_table)
+        if (op_key, dispatch_key) not in cls.ops_table:
+            if (op_key, "CUDA") not in cls.ops_table:
+                cls.lib.define(full_schema)
+            cls.lib.impl("wipflash2::" + op_key, op_impl, dispatch_key)
+            cls.ops_table[(op_key, dispatch_key)] = op_impl
+        return cls.ops_table[(op_key, dispatch_key)]
+
+
 @triton.jit
 def max_fn(x, y):
     return tl.math.max(x, y)
@@ -149,7 +164,7 @@ def _fwd_kernel(
     tl.store(O_block_ptr, acc.to(tl.float16))
 
 
-def attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
+def _attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
     """
     Implements SDPA but bias is addition of (rel_h + rel_w).view(..., rel_h.size(-2) * rel_w.size(-1))
     """
@@ -203,4 +218,24 @@ def attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
         num_warps=num_warps,
         num_stages=num_stages)
 
-    return o[:, :, :q_.size(-2), :]
+    return o[:, :, :q_.size(-2), :].contiguous()
+
+
+_WipFlash2Library.registerOp(
+    "mah_flash",
+    "mah_flash(Tensor q, Tensor k, Tensor v, Tensor rel_h, Tensor rel_w) -> Tensor",
+    _attention_rel_h_rel_w,
+    "CUDA",
+)
+
+
+def _attention_rel_h_rel_w_meta(q_, k_, v_, rel_h_, rel_w_):
+    return q_
+
+
+_WipFlash2Library.registerOp(
+    "mah_flash",
+    "mah_flash(Tensor q, Tensor k, Tensor v, Tensor rel_h, Tensor rel_w) -> Tensor",
+    _attention_rel_h_rel_w_meta,
+    "Meta",
+)
