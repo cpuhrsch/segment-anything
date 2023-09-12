@@ -129,8 +129,10 @@ def _fwd_kernel(
         # b_ptr_offsets_1 = b_ptr_offsets_m + b_ptr_offsets_n_1[None, :]
         # Combine and load
         b_mask = (start_n + tl.arange(0, BLOCK_N)) < (b0_numel * b0_numel)
-        b0 = tl.where(b_mask, tl.load(b0_ptr + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last'), float('-inf'))
-        b1 = tl.where(b_mask, tl.load(b1_ptr + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last'), float('-inf'))
+        # b0 = tl.where(b_mask, tl.load(b0_ptr + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last'), float('-inf'))
+        # b1 = tl.where(b_mask, tl.load(b1_ptr + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last'), float('-inf'))
+        b0 = tl.load(b0_ptr + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
+        b1 = tl.load(b1_ptr + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
         b = b0 + b1
 
         qk += b
