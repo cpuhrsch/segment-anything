@@ -240,7 +240,10 @@ class Attention(nn.Module):
         rel_w = rel_w.view(B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3))
 
         if self.use_rel_pos:
-            x = torch.ops.wipflash2.mah_flash(q, k, v, rel_h, rel_w)
+            # attn_bias = (rel_h + rel_w).view(B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4))
+            # x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+            # x = torch.ops.wipflash2.mah_flash(q, k, v, rel_h, rel_w)
+            x = _attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
         else:
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 

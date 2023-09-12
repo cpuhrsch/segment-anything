@@ -39,7 +39,7 @@ def max_fn(x, y):
 
 @triton.jit
 def _fwd_kernel(
-    Q, K, V, B0, B1, sm_scale,
+    Q, K, V, B0, sm_scale,
     L,
     Out,
     stride_qz, stride_qh, stride_qm, stride_qk,
@@ -51,7 +51,7 @@ def _fwd_kernel(
     H,
     N_CTX,
     P_SEQ,
-    b0_numel,
+    B0_NUMEL: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -106,9 +106,6 @@ def _fwd_kernel(
     # Get to the right rows
     b_ptr_offsets_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     b_ptr_offsets_m = b_ptr_offsets_m * stride_b0m
-    # b_ptr_offsets_m = b_ptr_offsets_m[:, None]
-    # b0_ptr = B0 + b_offset + b_ptr_offsets_m
-    # b1_ptr = B1 + b_offset + b_ptr_offsets_m
 
     for start_n in range(lo, hi, BLOCK_N):
         # -- load k, v --
@@ -120,19 +117,20 @@ def _fwd_kernel(
 
         # -- compute rel_h[:, None] + rel_w[None, :] bias ---
         # Get to the right column subsection
-        b_ptr_offsets_n_0 = (start_n + tl.arange(0, BLOCK_N)) // b0_numel
-        b_ptr_offsets_n_1 = (start_n + tl.arange(0, BLOCK_N)) % b0_numel
+        bias_last_size = (B0_NUMEL - 4) // 2
+        b_ptr_offsets_n_0 = (start_n + tl.arange(0, BLOCK_N)) // bias_last_size
+        b_ptr_offsets_n_1 = ((start_n + tl.arange(0, BLOCK_N)) % bias_last_size) + bias_last_size
         b_ptr_offsets_n_0 = b_ptr_offsets_n_0 * stride_b0n
         b_ptr_offsets_n_1 = b_ptr_offsets_n_1 * stride_b0n
         # # Construct the block of pointers
         # b_ptr_offsets_0 = b_ptr_offsets_m + b_ptr_offsets_n_0[None, :]
         # b_ptr_offsets_1 = b_ptr_offsets_m + b_ptr_offsets_n_1[None, :]
         # Combine and load
-        b_mask = (start_n + tl.arange(0, BLOCK_N)) < (b0_numel * b0_numel)
+        b_mask = (start_n + tl.arange(0, BLOCK_N)) < ((B0_NUMEL - 4) * (B0_NUMEL - 4))
         # b0 = tl.where(b_mask, tl.load(b0_ptr + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last'), float('-inf'))
         # b1 = tl.where(b_mask, tl.load(b1_ptr + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last'), float('-inf'))
         qk += tl.load(B0 + b_offset + b_ptr_offsets_m[:, None] + b_ptr_offsets_n_0[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
-        qk += tl.load(B1 + b_offset + b_ptr_offsets_m[:, None] + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
+        qk += tl.load(B0 + b_offset + b_ptr_offsets_m[:, None] + b_ptr_offsets_n_1[None, :], eviction_policy='evict_last', mask=b_mask[None, :], other=float('-inf'))
 
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
@@ -162,22 +160,7 @@ def _fwd_kernel(
     )
     tl.store(O_block_ptr, acc.to(tl.float16))
 
-
-def _attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
-    """
-    Implements SDPA but bias is addition of (rel_h + rel_w).view(..., rel_h.size(-2) * rel_w.size(-1))
-    """
-
-    import math
-    sm_scale = 1. / math.sqrt(q_.size(-1))
-    q_size_2_padded = (((q_.size(-2) + 256 - 1) // 256) * 256) - q_.size(-2)
-    q = torch.nn.functional.pad(q_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
-    k = torch.nn.functional.pad(k_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
-    v = torch.nn.functional.pad(v_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
-
-    rel_h = torch.nn.functional.pad(rel_h_.squeeze(-1), (0, 2, 0, q_size_2_padded), "constant", float("-inf"))
-    rel_w = torch.nn.functional.pad(rel_w_.squeeze(-2), (0, 2, 0, q_size_2_padded), "constant", float("-inf"))
-
+def _attention_rel_h_rel_w_kernel(q, k, v, rel_h_w, sm_scale):
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
@@ -193,15 +176,16 @@ def _attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
     L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
     P_SEQ = 0 if q.shape[-2] == k.shape[-2] else k.shape[-2] - q.shape[-2]
     assert P_SEQ == 0
-    assert rel_h.stride(0) == rel_w.stride(0)
-    assert rel_h.stride(1) == rel_w.stride(1)
-    assert rel_h.stride(2) == rel_w.stride(2)
-    assert rel_h.stride(3) == rel_w.stride(3)
-    assert rel_h.size(-1)  == rel_w.size(-1)
-    b0 = rel_h
-    b1 = rel_w
+    # assert rel_h.stride(0) == rel_w.stride(0)
+    # assert rel_h.stride(1) == rel_w.stride(1)
+    # assert rel_h.stride(2) == rel_w.stride(2)
+    # assert rel_h.stride(3) == rel_w.stride(3)
+    # assert rel_h.size(-1)  == rel_w.size(-1)
+    b0 = rel_h_w
     _fwd_kernel[grid](
-        q, k, v, b0, b1, sm_scale,
+        q, k, v,
+        b0,
+        sm_scale,
         L,
         o,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -213,29 +197,50 @@ def _attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
         q.shape[1],
         q.shape[2],
         P_SEQ,
-        b0.size(-1) - 2,
+        B0_NUMEL=b0.size(-1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
         num_warps=num_warps,
         num_stages=num_stages)
 
+    return o
+
+def _attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
+    """
+    Implements SDPA but bias is addition of (rel_h + rel_w).view(..., rel_h.size(-2) * rel_w.size(-1))
+    """
+
+    import math
+    sm_scale = 1. / math.sqrt(q_.size(-1))
+    q_size_2_padded = (((q_.size(-2) + 256 - 1) // 256) * 256) - q_.size(-2)
+    q = torch.nn.functional.pad(q_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
+    k = torch.nn.functional.pad(k_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
+    v = torch.nn.functional.pad(v_, (0, 0, 0, q_size_2_padded), "constant", 0).contiguous()
+
+    # rel_h = torch.nn.functional.pad(rel_h_.squeeze(-1), (0, 2, 0, q_size_2_padded), "constant", float("-inf"))
+    # rel_w = torch.nn.functional.pad(rel_w_.squeeze(-2), (0, 2, 0, q_size_2_padded), "constant", float("-inf"))
+    rel_h_w_ = torch.cat([rel_h_.squeeze(-1), rel_w_.squeeze(-2)], dim=-1)
+    rel_h_w = torch.nn.functional.pad(rel_h_w_, (0, 4, 0, q_size_2_padded), "constant", float("-inf"))
+
+    # o = _attention_rel_h_rel_w_kernel(q, k, v, rel_h_w, sm_scale)
+    o = torch.ops.wipflash2.mah_flash(q, k, v, rel_h_w, sm_scale)
     return o[:, :, :q_.size(-2), :].contiguous()
 
 
 _WipFlash2Library.registerOp(
     "mah_flash",
-    "mah_flash(Tensor q, Tensor k, Tensor v, Tensor rel_h, Tensor rel_w) -> Tensor",
-    _attention_rel_h_rel_w,
+    "mah_flash(Tensor q, Tensor k, Tensor v, Tensor rel_h_w, float sm_scale) -> Tensor",
+    _attention_rel_h_rel_w_kernel,
     "CUDA",
 )
 
 
-def _attention_rel_h_rel_w_meta(q_, k_, v_, rel_h_, rel_w_):
+def _attention_rel_h_rel_w_kernel_meta(q_, k_, v_, rel_h_w, sm_scale):
     return q_
 
 
 _WipFlash2Library.registerOp(
     "mah_flash",
-    "mah_flash(Tensor q, Tensor k, Tensor v, Tensor rel_h, Tensor rel_w) -> Tensor",
-    _attention_rel_h_rel_w_meta,
+    "mah_flash(Tensor q, Tensor k, Tensor v, Tensor rel_h_w, float sm_scale) -> Tensor",
+    _attention_rel_h_rel_w_kernel_meta,
     "Meta",
 )
