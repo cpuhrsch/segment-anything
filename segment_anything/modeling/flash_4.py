@@ -459,8 +459,8 @@ def _attention_rel_h_rel_w_kernel_aligned_meta(q_, k_, v_, rel_h_w, sm_scale):
 
 
 _WipFlash2Library.registerOp(
-    "mah_flash",
-    "mah_flash(Tensor q, Tensor k, Tensor v, Tensor rel_h_w, float sm_scale) -> Tensor",
+    "mah_flash_aligned",
+    "mah_flash_aligned(Tensor q, Tensor k, Tensor v, Tensor rel_h_w, float sm_scale) -> Tensor",
     _attention_rel_h_rel_w_kernel_aligned_meta,
     "Meta",
 )
