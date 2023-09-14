@@ -330,14 +330,14 @@ def _fwd_kernel_aligned(
     tl.store(O_block_ptr, acc.to(tl.float16))
 
 def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
-    # q = q.contiguous()
-    # k = k.contiguous()
-    # v = v.contiguous()
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128}
-    o = torch.empty_like(q) #, memory_format=torch.contiguous_format)
+    o = torch.empty_like(q, memory_format=torch.contiguous_format)
 
     BLOCK_M = 128
 
@@ -473,7 +473,7 @@ _WipFlash2Library.registerOp(
 
 
 def _attention_rel_h_rel_w_kernel_aligned_meta(q_, k_, v_, rel_h_w, sm_scale):
-    return q_
+    return q_.contiguous()
 
 
 _WipFlash2Library.registerOp(
