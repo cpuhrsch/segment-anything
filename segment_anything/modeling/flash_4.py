@@ -219,10 +219,10 @@ def _attention_rel_h_rel_w_kernel(q, k, v, rel_h_w, sm_scale):
 def _fwd_kernel_aligned(
     Q, K, V, B0, sm_scale,
     Out,
-    stride_qh, stride_qm,
-    stride_kh, stride_kn,
-    stride_vh, stride_vk,
-    stride_oh, stride_om,
+    stride_qh, stride_qm, stride_qk,
+    stride_kh, stride_kn, stride_kk,
+    stride_vh, stride_vk, stride_vn,
+    stride_oh, stride_om, stride_on,
     stride_b0h, stride_b0m,
     Z,
     H,
@@ -244,7 +244,7 @@ def _fwd_kernel_aligned(
     Q_block_ptr = tl.make_block_ptr(
         base=Q + q_offset,
         shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_qm, 1),
+        strides=(stride_qm, stride_qk),
         offsets=(start_m * BLOCK_M, 0),
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0)
@@ -252,7 +252,7 @@ def _fwd_kernel_aligned(
     K_block_ptr = tl.make_block_ptr(
         base=K + kv_offset,
         shape=(BLOCK_DMODEL, N_CTX + P_SEQ),
-        strides=(1, stride_kn),
+        strides=(stride_kk, stride_kn),
         offsets=(0, 0),
         block_shape=(BLOCK_DMODEL, BLOCK_N),
         order=(0, 1)
@@ -260,7 +260,7 @@ def _fwd_kernel_aligned(
     V_block_ptr = tl.make_block_ptr(
         base=V + kv_offset,
         shape=(N_CTX + P_SEQ, BLOCK_DMODEL),
-        strides=(stride_vk, 1),
+        strides=(stride_vk, stride_vn),
         offsets=(0, 0),
         block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0)
@@ -322,7 +322,7 @@ def _fwd_kernel_aligned(
     O_block_ptr = tl.make_block_ptr(
         base=Out + q_offset,
         shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_om, 1),
+        strides=(stride_om, stride_on),
         offsets=(start_m * BLOCK_M, 0),
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0)
@@ -330,14 +330,14 @@ def _fwd_kernel_aligned(
     tl.store(O_block_ptr, acc.to(tl.float16))
 
 def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+    # q = q.contiguous()
+    # k = k.contiguous()
+    # v = v.contiguous()
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
     assert Lk in {16, 32, 64, 128}
-    o = torch.empty_like(q)
+    o = torch.empty_like(q) #, memory_format=torch.contiguous_format)
 
     BLOCK_M = 128
 
@@ -372,20 +372,20 @@ def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
     # assert rel_h.stride(3) == rel_w.stride(3)
     # assert rel_h.size(-1)  == rel_w.size(-1)
     b = rel_h_w
-    assert q.is_contiguous()
-    assert k.is_contiguous()
-    assert v.is_contiguous()
-    assert o.is_contiguous()
-    assert b.is_contiguous()
+    # assert q.is_contiguous(), str(q.stride())
+    # assert k.is_contiguous(), str(k.stride())
+    # assert v.is_contiguous(), str(v.stride())
+    # assert o.is_contiguous(), str(o.stride())
+    assert b.is_contiguous(), str(b.stride())
     _fwd_kernel_aligned[grid](
         q, k, v,
         b,
         sm_scale,
         o,
-        q.stride(1), q.stride(2),
-        k.stride(1), k.stride(2),
-        v.stride(1), v.stride(2),
-        o.stride(1), o.stride(2),
+        q.stride(1), q.stride(2), q.stride(3),
+        k.stride(1), k.stride(2), k.stride(3),
+        v.stride(1), v.stride(2), v.stride(3),
+        o.stride(1), o.stride(2), o.stride(3),
         b.stride(1), b.stride(2),
         q.shape[0],
         q.shape[1],
@@ -415,12 +415,12 @@ def _attention_rel_h_rel_w(q_, k_, v_, rel_h_, rel_w_):
         return torch.ops.wipflash2.mah_flash_aligned(q_, k_, v_, rel_h_w, sm_scale)
     if q_size_2_padded == 0 and q_.size(-1) == 80:
         # print("USING ALIGNED")
-        q = torch.nn.functional.pad(q_, (0, 128 - 80, 0, 0), "constant", 0).contiguous()
-        k = torch.nn.functional.pad(k_, (0, 128 - 80, 0, 0), "constant", 0).contiguous()
-        v = torch.nn.functional.pad(v_, (0, 128 - 80, 0, 0), "constant", 0).contiguous()
+        q = torch.nn.functional.pad(q_, (0, 128 - 80, 0, 0), "constant", 0) #.contiguous()
+        k = torch.nn.functional.pad(k_, (0, 128 - 80, 0, 0), "constant", 0) #.contiguous()
+        v = torch.nn.functional.pad(v_, (0, 128 - 80, 0, 0), "constant", 0) #.contiguous()
         rel_h_w = torch.cat([rel_h_.squeeze(-1), rel_w_.squeeze(-2)], dim=-1)
         o = torch.ops.wipflash2.mah_flash_aligned(q, k, v, rel_h_w, sm_scale)
-        return o[:, :, :, :80].contiguous()
+        return o[:, :, :, :80] #.contiguous()
     attn_bias = (rel_h_ + rel_w_).view(q_.size(0), q_.size(1), rel_h_.size(2), rel_h_.size(3) * rel_w_.size(4))
     return torch.nn.functional.scaled_dot_product_attention(q_, k_, v_, attn_mask=attn_bias)
     print("USING NOT ALIGNED")
@@ -447,6 +447,13 @@ _WipFlash2Library.registerOp(
 
 
 def _attention_rel_h_rel_w_kernel_meta(q_, k_, v_, rel_h_w, sm_scale):
+    torch._check(q_.dim() == 4, f"Ugh wtf q is {q_.dim()}")
+    torch._check(k_.dim() == 4, f"Ugh wtf k is {k_.dim()}")
+    torch._check(v_.dim() == 4, f"Ugh wtf v is {v_.dim()}")
+
+    torch._check(q_.is_contiguous() == 4, f"Ugh wtf q strdies is {q_.stride()}")
+    torch._check(k_.is_contiguous() == 4, f"Ugh wtf k strdies is {k_.stride()}")
+    torch._check(v_.is_contiguous() == 4, f"Ugh wtf v strdies is {v_.stride()}")
     return q_
 
 
@@ -466,7 +473,7 @@ _WipFlash2Library.registerOp(
 
 
 def _attention_rel_h_rel_w_kernel_aligned_meta(q_, k_, v_, rel_h_w, sm_scale):
-    return q_.contiguous()
+    return q_
 
 
 _WipFlash2Library.registerOp(
