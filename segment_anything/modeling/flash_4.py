@@ -285,7 +285,7 @@ def _fwd_kernel_aligned(
     b_ptr_offsets_m = tl.arange(0, BLOCK_M)
 
     b_offset = off_hz * stride_b0h
-    b_ptr_offsets_n_1 = tl.arange(BLOCK_N, 2 * BLOCK_N)
+    b_ptr_offsets_n_1 = (tl.arange(0, BLOCK_N) % BIAS_LAST_SIZE) + BIAS_LAST_SIZE
     b1 = tl.load(B0 + b_offset + ((start_m * BLOCK_M + b_ptr_offsets_m) * stride_b0m)[:, None] + b_ptr_offsets_n_1[None, :])
     for start_n in range(lo, hi, BLOCK_N):
         # -- load k, v --
@@ -329,38 +329,47 @@ def _fwd_kernel_aligned(
     )
     tl.store(O_block_ptr, acc.to(tl.float16))
 
-def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    # shape constraints
+
+def _autotune(configs, function):
+    import torch.utils.benchmark as benchmark
+    def benchmark_torch_function_in_microseconds(f, *args, **kwargs):
+        try:
+            f(*args, **kwargs)
+            t0 = benchmark.Timer(
+                stmt="f(*args, **kwargs)", globals={"args": args, "kwargs": kwargs, "f": f}
+            )
+        except:
+            return None
+        return t0.blocked_autorange().mean * 1e6
+
+    best = None
+    for config in configs:
+        BLOCK_M, BLOCK_N, num_warps, num_stages = config
+        t_config = benchmark_torch_function_in_microseconds(function, BLOCK_M, BLOCK_N, num_warps, num_stages)
+        if t_config is not None:
+            if best is not None:
+                if t_config < best:
+                    best = t_config
+                    best_config = config
+            else:
+                best = t_config
+                best_config = config
+        print(str(config), " :", str(t_config))
+    return best, best_config
+
+BEST_CONFIGS = {}
+
+def _attention_rel_h_rel_w_kernel_aligned_device(q, k, v, rel_h_w, sm_scale, o,
+                                                 BLOCK_M,
+                                                 BLOCK_N,
+                                                 num_warps,
+                                                 num_stages):
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
-    assert Lq == Lk and Lk == Lv
-    assert Lk in {16, 32, 64, 128}
-    o = torch.empty_like(q, memory_format=torch.contiguous_format)
-
-    BLOCK_M = 128
-
-    BLOCK_N = 64 if Lk <= 64 else 32
-    num_stages = 4 if Lk <= 64 else 3
-
-    BLOCK_N = 64
-    num_stages = 4
-
-    num_warps = 4
-
-    BLOCK_M = 64 # 128
-    BLOCK_N = 64
-    num_warps = 4
-
-    # Auto tune this number
-    num_stages = 2
-
     assert q.size() == k.size()
     assert q.size() == v.size()
     assert q.size(-2) == rel_h_w.size(-2)
     assert rel_h_w.size(-1) == 128
-    assert rel_h_w.size(-1) == 2 * BLOCK_N
+    # assert rel_h_w.size(-1) == 2 * BLOCK_N
 
     grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
     # print("q.shape[0] * q.shape[1]: ", q.shape[0] * q.shape[1])
@@ -391,13 +400,92 @@ def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
         q.shape[1],
         q.shape[2],
         P_SEQ,
-        BIAS_LAST_SIZE=((b.size(-1) - 4) // 2),
+        BIAS_LAST_SIZE=(b.size(-1) // 2),
         B0_NUMEL=b.size(-1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=Lk,
         num_warps=num_warps,
         num_stages=num_stages)
+
+def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    # shape constraints
+    Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+    assert Lq == Lk and Lk == Lv
+    assert Lk in {16, 32, 64, 128}
+    o = torch.empty_like(q, memory_format=torch.contiguous_format)
+
+    key = (q.size(),   k.size(),   v.size(),   rel_h_w.size(),   o.size(),
+           q.stride(), k.stride(), v.stride(), rel_h_w.stride(), o.stride())
+    if key not in BEST_CONFIGS:
+        print("key ", key, " not found. Running autotune")
+        import functools
+        best, best_config = _autotune([
+            (128,  64, 8, 1),
+            ( 64, 128, 8, 1),
+            (128, 128, 8, 1),
+            ( 64,  64, 8, 1),
+            (128,  64, 8, 2),
+            ( 64, 128, 8, 2),
+            (128, 128, 8, 2),
+            ( 64,  64, 8, 2),
+            (128,  64, 8, 3),
+            ( 64, 128, 8, 3),
+            (128, 128, 8, 3),
+            ( 64,  64, 8, 3),
+            (128,  64, 8, 4),
+            ( 64, 128, 8, 4),
+            (128, 128, 8, 4),
+            ( 64,  64, 8, 4),
+            (128,  64, 8, 5),
+            ( 64, 128, 8, 5),
+            (128, 128, 8, 5),
+            ( 64,  64, 8, 5),
+            (128,  64, 8, 8),
+            ( 64, 128, 8, 8),
+            (128, 128, 8, 8),
+            ( 64,  64, 8, 8),
+
+            (128,  64, 4, 1),
+            ( 64, 128, 4, 1),
+            (128, 128, 4, 1),
+            ( 64,  64, 4, 1),
+            (128,  64, 4, 2),
+            ( 64, 128, 4, 2),
+            (128, 128, 4, 2),
+            ( 64,  64, 4, 2),
+            (128,  64, 4, 4),
+            ( 64, 128, 4, 4),
+            (128, 128, 4, 4),
+            ( 64,  64, 4, 4),
+
+            (128,  64, 2, 1),
+            ( 64, 128, 2, 1),
+            (128, 128, 2, 1),
+            ( 64,  64, 2, 1),
+            (128,  64, 2, 2),
+            ( 64, 128, 2, 2),
+            (128, 128, 2, 2),
+            ( 64,  64, 2, 2),
+            ], functools.partial(_attention_rel_h_rel_w_kernel_aligned_device,
+                q, k, v, rel_h_w, sm_scale, o))
+        BEST_CONFIGS[key] = best_config
+        print("Found best_config ", best_config, " with time ", best, " for key ", key)
+    best_config = BEST_CONFIGS[key]
+
+    _attention_rel_h_rel_w_kernel_aligned_device(q,
+                                                 k,
+                                                 v,
+                                                 rel_h_w,
+                                                 sm_scale,
+                                                 o,
+                                                 best_config[0],
+                                                 best_config[1],
+                                                 best_config[2],
+                                                 best_config[3])
 
     return o
 
