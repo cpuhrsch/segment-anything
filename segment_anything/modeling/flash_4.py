@@ -358,6 +358,11 @@ def _autotune(configs, function):
     return best, best_config
 
 BEST_CONFIGS = {}
+BEST_CONFIGS[(torch.Size([60, 12, 4096, 64]), torch.Size([60, 12, 4096, 64]), torch.Size([60, 12, 4096, 64]), torch.Size([60, 12, 4096, 128]), torch.Size([60, 12, 4096, 64]), (3145728, 262144, 64, 1), (3145728, 262144, 64, 1), (3145728, 262144, 64, 1), (6291456, 524288, 128, 1), (3145728, 262144, 64, 1))] = (64, 64, 4, 2)
+BEST_CONFIGS[(torch.Size([ 1, 12, 4096, 64]), torch.Size([ 1, 12, 4096, 64]), torch.Size([ 1, 12, 4096, 64]), torch.Size([ 1, 12, 4096, 128]), torch.Size([ 1, 12, 4096, 64]), (3145728, 262144, 64, 1), (3145728, 262144, 64, 1), (3145728, 262144, 64, 1), (6291456, 524288, 128, 1), (3145728, 262144, 64, 1))] = (64, 128, 4, 2)
+BEST_CONFIGS[(torch.Size([1, 16, 4096, 128]), torch.Size([1, 16, 4096, 128]), torch.Size([1, 16, 4096, 128]), torch.Size([1, 16, 4096, 128]), torch.Size([1, 16, 4096, 128]), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1))] = (128, 64, 8, 3)
+BEST_CONFIGS[(torch.Size([100, 16, 4096, 128]), torch.Size([100, 16, 4096, 128]), torch.Size([100, 16, 4096, 128]), torch.Size([100, 16, 4096, 128]), torch.Size([100, 16, 4096, 128]), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1))] = (128, 64, 8, 3)
+BEST_CONFIGS[(torch.Size([50, 16, 4096, 128]), torch.Size([50, 16, 4096, 128]), torch.Size([50, 16, 4096, 128]), torch.Size([50, 16, 4096, 128]), torch.Size([50, 16, 4096, 128]), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1), (8388608, 524288, 128, 1))] = (128, 64, 8, 3)
 
 def _attention_rel_h_rel_w_kernel_aligned_device(q, k, v, rel_h_w, sm_scale, o,
                                                  BLOCK_M,
@@ -423,69 +428,17 @@ def _attention_rel_h_rel_w_kernel_aligned(q, k, v, rel_h_w, sm_scale):
     if key not in BEST_CONFIGS:
         print("key ", key, " not found. Running autotune")
         import functools
-        best, best_config = _autotune([
-            (128,  64, 8, 1),
-            ( 64, 128, 8, 1),
-            (128, 128, 8, 1),
-            ( 64,  64, 8, 1),
-            (128,  64, 8, 2),
-            ( 64, 128, 8, 2),
-            (128, 128, 8, 2),
-            ( 64,  64, 8, 2),
-            (128,  64, 8, 3),
-            ( 64, 128, 8, 3),
-            (128, 128, 8, 3),
-            ( 64,  64, 8, 3),
-            (128,  64, 8, 4),
-            ( 64, 128, 8, 4),
-            (128, 128, 8, 4),
-            ( 64,  64, 8, 4),
-            (128,  64, 8, 5),
-            ( 64, 128, 8, 5),
-            (128, 128, 8, 5),
-            ( 64,  64, 8, 5),
-            (128,  64, 8, 8),
-            ( 64, 128, 8, 8),
-            (128, 128, 8, 8),
-            ( 64,  64, 8, 8),
-
-            (128,  64, 4, 1),
-            ( 64, 128, 4, 1),
-            (128, 128, 4, 1),
-            ( 64,  64, 4, 1),
-            (128,  64, 4, 2),
-            ( 64, 128, 4, 2),
-            (128, 128, 4, 2),
-            ( 64,  64, 4, 2),
-            (128,  64, 4, 3),
-            ( 64, 128, 4, 3),
-            (128, 128, 4, 3),
-            ( 64,  64, 4, 3),
-            (128,  64, 4, 4),
-            ( 64, 128, 4, 4),
-            (128, 128, 4, 4),
-            ( 64,  64, 4, 4),
-
-            (128,  64, 2, 1),
-            ( 64, 128, 2, 1),
-            (128, 128, 2, 1),
-            ( 64,  64, 2, 1),
-            (128,  64, 2, 2),
-            ( 64, 128, 2, 2),
-            (128, 128, 2, 2),
-            ( 64,  64, 2, 2),
-            (128,  64, 2, 3),
-            ( 64, 128, 2, 3),
-            (128, 128, 2, 3),
-            ( 64,  64, 2, 3),
-            (128,  64, 2, 4),
-            ( 64, 128, 2, 4),
-            (128, 128, 2, 4),
-            ( 64,  64, 2, 4),
-            ], functools.partial(_attention_rel_h_rel_w_kernel_aligned_device,
-                q, k, v, rel_h_w, sm_scale, o))
+        import itertools
+        configs = []
+        for (BLOCK_M, BLOCK_N, num_warps) in itertools.product([64, 128], [64, 128], [1, 2, 4, 8]):
+            for num_stages in range(1, num_warps + 1):
+                configs.append((BLOCK_M, BLOCK_N, num_warps, num_stages))
+        print("all configs len: ", len(configs))
+        best, best_config = _autotune(configs, functools.partial(_attention_rel_h_rel_w_kernel_aligned_device,
+                                                                 q, k, v, rel_h_w, sm_scale, o))
         BEST_CONFIGS[key] = best_config
-        print("Found best_config ", best_config, " with time ", best, " for key ", key)
+        print("Found best_config ", best_config,
+              " with time ", best, " for key ", key)
     best_config = BEST_CONFIGS[key]
 
     _attention_rel_h_rel_w_kernel_aligned_device(q,
